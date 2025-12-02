@@ -320,7 +320,7 @@ int engine_start(engine_t *e)
 
     int expected = 0;
     if (!atomic_compare_exchange_strong(&e->running, &expected, 1))
-        return 1;
+        return 0;
 
     if (pthread_create(&e->thread, NULL, engine_thread_main, e) != 0)
     {
