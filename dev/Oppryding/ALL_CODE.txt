@@ -1,0 +1,1712 @@
+
+========================================
+FILE: ALL_CODE copy.txt
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/ALL_CODE copy.txt
+========================================
+for f in engine.c engine.h routes.c routes.h matrix.c matrix.h ringbuffer.h results.h ticks.c ticks.h engine_R.c engine_py.py CMakeLists.txt; do
+  echo "===== $f ====="
+  sed -n '1,99999p' "$f"
+  echo
+done > ALL_CODE.txt
+
+
+
+cd ~/user/sigurdberner/"FX_ARBITRAGE_FINALE copy"
+
+cat ALL_CODE.txt | pbcopy
+
+
+========================================
+FILE: CMakeLists.txt
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/CMakeLists.txt
+========================================
+cmake_minimum_required(VERSION 3.16)
+project(engine_v4 C)
+
+set(CMAKE_C_STANDARD 11)
+set(CMAKE_C_STANDARD_REQUIRED ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
+
+# macOS: allow unresolved symbols for R
+if(APPLE)
+    set(CMAKE_C_VISIBILITY_PRESET default)
+    set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
+endif()
+
+# ---- Finn R include path ----
+execute_process(
+  COMMAND R RHOME
+  OUTPUT_VARIABLE R_HOME
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+
+set(R_INCLUDE_DIR "${R_HOME}/include")
+
+# ---- Kilder ----
+set(SRC
+    engine.c
+    engine_R.c
+    routes.c
+    matrix.c
+    ticks.c
+)
+
+add_library(engine_v4 SHARED ${SRC})
+
+# ---- Include dirs ----
+target_include_directories(engine_v4 PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${R_INCLUDE_DIR}
+)
+
+# ---- macOS: dynamic lookup ----
+if(APPLE)
+    target_link_options(engine_v4 PRIVATE "-Wl,-undefined,dynamic_lookup")
+endif()
+
+# ---- Optimalisering ----
+if (CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
+    target_compile_options(engine_v4 PRIVATE -O3 -march=native)
+endif()
+
+set_target_properties(engine_v4 PROPERTIES OUTPUT_NAME "engine_v4")
+
+
+========================================
+FILE: engine wrappers usikker 2.r
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/engine wrappers usikker 2.r
+========================================
+    # ================================================================
+#  Engine_Wrapper.R — R KOBLING TIL engine_v4 (TRI only)
+# ================================================================
+
+`%||%` <- function(a, b) if (is.null(a)) b else a
+
+.eng <- NULL
+.eng_meta <- list(ccys = NULL, start_ccy = NULL)
+
+# -----------------------------------------------------------
+# 1) Last C-motor (dylib)
+# -----------------------------------------------------------
+engine_load <- function(path = file.path("C++", "build", "libengine_v4.dylib")) {
+  path <- normalizePath(path, mustWork = TRUE)
+  if (!is.loaded("engine_create")) {
+    dyn.load(path)
+  }
+  invisible(TRUE)
+}
+
+# -----------------------------------------------------------
+# 2) Generate TRI route matrix (mid, end)
+#    ✔ matches C signature EXACTLY
+# -----------------------------------------------------------
+precompute_route_idx <- function(ccys, start_ccy) {
+  stopifnot(is.character(ccys), length(ccys) > 2L)
+  
+  s <- match(start_ccy, ccys)
+  if (is.na(s))
+    stop("precompute_route_idx: start_ccy not in ccys")
+  
+  idx <- setdiff(seq_along(ccys), s)
+  g <- expand.grid(mid_i = idx, end_i = idx, KEEP.OUT.ATTRS = FALSE)
+  g <- g[g$mid_i != g$end_i, ]
+  
+  out <- as.matrix(
+    data.frame(
+      mid_i = as.integer(g$mid_i),
+      end_i = as.integer(g$end_i)
+    )
+  )
+  storage.mode(out) <- "integer"
+  out
+}
+
+.engine_push_mats <- function(ptr, state) {
+  M   <- state$M
+  BID <- state$BID
+  ASK <- state$ASK
+  
+  n <- nrow(M)
+  
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      b <- BID[i, j]
+      a <- ASK[i, j]
+      
+      if (is.finite(b) && is.finite(a) && b > 0 && a > 0) {
+        .Call("engine_push_tick_R",
+              ptr,
+              as.integer(i),
+              as.integer(j),
+              as.numeric(b),
+              as.numeric(a))
+      }
+    }
+  }
+  
+  invisible(TRUE)
+}
+
+
+
+
+engine_push_tick <- function(ptr, i, j, bid, ask) {
+  .Call(
+    "engine_push_tick_R",
+    ptr,
+    as.integer(i),
+    as.integer(j),
+    as.numeric(bid),
+    as.numeric(ask)
+  )
+}
+# -----------------------------------------------------------
+# 3) Pump full matrix into engine
+# -----------------------------------------------------------
+
+
+# -----------------------------------------------------------
+# 4) Init full engine (TRI only)
+# -----------------------------------------------------------
+engine_init <- function(state, start_ccy) {
+  stopifnot(
+    is.matrix(state$M),
+    is.matrix(state$BID),
+    is.matrix(state$ASK)
+  )
+  
+  ccys <- rownames(state$M)
+  start_i <- match(start_ccy, ccys)
+  if (is.na(start_i))
+    stop("engine_init: start_ccy not in M")
+  
+  # Build routes exactly as C expects (mid, end)
+  if (is.null(state$route_idx) || !nrow(state$route_idx)) {
+    state$route_idx <- precompute_route_idx(ccys, start_ccy)
+  }
+  
+  if (!nrow(state$route_idx))
+    stop("engine_init: route_idx empty")
+  
+  # ---------- C CALL ----------
+  eng <- .Call(
+    "engine_create",
+    state$route_idx,           # integer matrix (n x 2)
+    as.integer(start_i),       # start index (1-based)
+    as.integer(length(ccys))   # n_ccy
+  )
+  # -----------------------------
+  
+  # Start C-thread
+  .Call("engine_start_R", eng)
+  
+  # Push initial matrix state
+  .engine_push_mats(eng, state)
+  
+  # Save static pointer
+  .eng <<- eng
+  .eng_meta <<- list(
+    ccys = ccys,
+    start_ccy = start_ccy
+  )
+  
+  invisible(TRUE)
+}
+
+# -----------------------------------------------------------
+# 5) Refresh engine matrix (on rebuild)
+# -----------------------------------------------------------
+engine_refresh_mats <- function(state) {
+  if (is.null(.eng)) return(invisible(FALSE))
+  .engine_push_mats(.eng, state)
+  invisible(TRUE)
+}
+
+engine_reinit_if_needed <- function(state, start_ccy) {
+  ccys <- rownames(state$M)
+  
+  need <- (
+    is.null(.eng) ||
+      !identical(.eng_meta$ccys, ccys) ||
+      !identical(.eng_meta$start_ccy, start_ccy)
+  )
+  
+  if (need)
+    engine_init(state, start_ccy)
+  
+  invisible(TRUE)
+}
+
+# -----------------------------------------------------------
+# 6) Poll → data.frame
+# -----------------------------------------------------------
+engine_poll_df <- function() {
+  if (is.null(.eng)) return(NULL)
+  
+  df <- .Call("engine_poll", .eng)
+  if (is.null(df) || nrow(df) == 0)
+    return(NULL)
+  
+  df
+}
+
+# -----------------------------------------------------------
+# 7) Tick eval (just poll)
+# -----------------------------------------------------------
+engine_tick_eval <- function(state) {
+  if (is.null(.eng)) return(NULL)
+  engine_poll_df()
+}
+
+engine_wrappers_ready <- function() TRUE
+
+
+
+
+engine_push_tick <- function(ptr, i, j, bid, ask) {
+  .Call(
+    "engine_push_tick_R",
+    ptr,
+    as.integer(i),
+    as.integer(j),
+    as.numeric(bid),
+    as.numeric(ask)
+  )
+}
+
+
+
+
+
+
+
+
+
+
+
+
+========================================
+FILE: engine_py.py
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/engine_py.py
+========================================
+import ctypes
+import os
+import sys
+
+# Adjust name if you build different
+if sys.platform == "darwin":
+    LIBNAME = "libengine_v4.dylib"
+elif sys.platform.startswith("linux"):
+    LIBNAME = "libengine_v4.so"
+else:
+    raise RuntimeError("Unsupported platform")
+
+_here = os.path.dirname(os.path.abspath(__file__))
+_libpath = os.path.join(_here, LIBNAME)
+
+lib = ctypes.CDLL(_libpath)
+
+# ---- signatures ----
+lib.engine_create_tri.restype = ctypes.c_void_p
+lib.engine_create_tri.argtypes = [
+    ctypes.c_int, ctypes.c_int,
+    ctypes.POINTER(ctypes.c_int), ctypes.c_int,
+    ctypes.c_int
+]
+
+lib.engine_start.restype = ctypes.c_int
+lib.engine_start.argtypes = [ctypes.c_void_p]
+
+lib.engine_stop.restype = None
+lib.engine_stop.argtypes = [ctypes.c_void_p]
+
+lib.engine_destroy.restype = None
+lib.engine_destroy.argtypes = [ctypes.c_void_p]
+
+lib.engine_push_tick.restype = ctypes.c_int
+lib.engine_push_tick.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.c_int, ctypes.c_double, ctypes.c_double]
+
+class Result(ctypes.Structure):
+    _fields_ = [
+        ("route_id", ctypes.c_int),
+        ("mid_i", ctypes.c_int),
+        ("end_i", ctypes.c_int),
+        ("edge", ctypes.c_double),
+        ("final_base", ctypes.c_double),
+        ("pnl", ctypes.c_double),
+        ("pct", ctypes.c_double),
+        ("ts_ns", ctypes.c_uint64),
+    ]
+
+lib.engine_pop_result.restype = ctypes.c_int
+lib.engine_pop_result.argtypes = [ctypes.c_void_p, ctypes.POINTER(Result)]
+
+class Engine:
+    def __init__(self, n_ccy, start_i_1b, routes_mid_end_1b):
+        # routes_mid_end_1b: list of (mid,end) 1-based
+        flat = []
+        for mid, end in routes_mid_end_1b:
+            flat.extend([mid, end])
+        arr = (ctypes.c_int * len(flat))(*flat)
+        self._eng = lib.engine_create_tri(n_ccy, start_i_1b, arr, len(routes_mid_end_1b), 1)
+        if not self._eng:
+            raise RuntimeError("engine_create_tri failed")
+
+    def start(self):
+        return bool(lib.engine_start(self._eng))
+
+    def stop(self):
+        lib.engine_stop(self._eng)
+
+    def destroy(self):
+        if self._eng:
+            lib.engine_destroy(self._eng)
+            self._eng = None
+
+    def push_tick(self, i_1b, j_1b, bid, ask):
+        return bool(lib.engine_push_tick(self._eng, i_1b, j_1b, float(bid), float(ask)))
+
+    def poll(self):
+        out = []
+        r = Result()
+        while lib.engine_pop_result(self._eng, ctypes.byref(r)):
+            out.append({
+                "route_id": r.route_id,
+                "mid": r.mid_i,
+                "end": r.end_i,
+                "pnl": r.pnl,
+                "edge": r.edge,
+                "final_base": r.final_base,
+                "pct": r.pct,
+                "ts_ns": int(r.ts_ns),
+            })
+        return out
+
+
+========================================
+FILE: engine_R.c
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/engine_R.c
+========================================
+#include <R.h>
+#include <Rinternals.h>
+#include <stdint.h>
+#include <stdlib.h>
+
+#include "engine.h"
+#include "results.h"
+
+// finalizer
+static void engine_xptr_finalizer(SEXP xptr)
+{
+    engine_t *eng = (engine_t *)R_ExternalPtrAddr(xptr);
+    if (eng)
+    {
+        engine_stop(eng);
+        engine_destroy(eng);
+        R_ClearExternalPtr(xptr);
+    }
+}
+
+// R integer matrix is column-major; convert to row-major int*
+static int *int_matrix_to_rowmajor(SEXP mat, int *out_nrow, int *out_ncol)
+{
+    if (!isInteger(mat) || !isMatrix(mat))
+        error("routes must be an integer matrix");
+
+    SEXP dim = getAttrib(mat, R_DimSymbol);
+    int nrow = INTEGER(dim)[0];
+    int ncol = INTEGER(dim)[1];
+    if (nrow <= 0 || ncol <= 0)
+        error("routes has invalid dimensions");
+
+    int *src = INTEGER(mat);
+    int *dst = (int *)malloc((size_t)nrow * (size_t)ncol * sizeof(int));
+    if (!dst)
+        error("malloc failed");
+
+    for (int r = 0; r < nrow; ++r)
+    {
+        for (int c = 0; c < ncol; ++c)
+        {
+            dst[(size_t)r * (size_t)ncol + (size_t)c] = src[r + nrow * c];
+        }
+    }
+
+    *out_nrow = nrow;
+    *out_ncol = ncol;
+    return dst;
+}
+
+// .Call engine_create(routes, start_i_1b, n_ccy)
+// routes:
+//   - if ncol==2 => TRI routes (mid,end) 1-based
+//   - if ncol>=3 => cycle nodes (N legs) 1-based
+SEXP engine_create(SEXP routes, SEXP start_i_1b, SEXP n_ccy)
+{
+    if (!isInteger(start_i_1b) || LENGTH(start_i_1b) != 1)
+        error("start_i_1b must be integer(1)");
+    if (!isInteger(n_ccy) || LENGTH(n_ccy) != 1)
+        error("n_ccy must be integer(1)");
+
+    int start = INTEGER(start_i_1b)[0];
+    int n = INTEGER(n_ccy)[0];
+
+    int nrow = 0, ncol = 0;
+    int *rowmajor = int_matrix_to_rowmajor(routes, &nrow, &ncol);
+
+    engine_t *eng = NULL;
+    if (ncol == 2)
+    {
+        eng = engine_create_tri(n, start, rowmajor, nrow, /*one_based=*/1);
+    }
+    else if (ncol >= 3)
+    {
+        eng = engine_create_cycle(n, start, rowmajor, nrow, ncol, /*one_based=*/1);
+    }
+    else
+    {
+        free(rowmajor);
+        error("routes must have at least 2 columns");
+    }
+
+    free(rowmajor);
+    if (!eng)
+        error("engine_create failed");
+
+    SEXP xptr = PROTECT(R_MakeExternalPtr((void *)eng, R_NilValue, R_NilValue));
+    R_RegisterCFinalizerEx(xptr, engine_xptr_finalizer, 1);
+    UNPROTECT(1);
+    return xptr;
+}
+
+SEXP engine_start_R(SEXP xptr)
+{
+    engine_t *eng = (engine_t *)R_ExternalPtrAddr(xptr);
+    if (!eng)
+        error("engine ptr is null");
+    return ScalarLogical(engine_start(eng) ? 1 : 0);
+}
+
+SEXP engine_stop_R(SEXP xptr)
+{
+    engine_t *eng = (engine_t *)R_ExternalPtrAddr(xptr);
+    if (!eng)
+        return R_NilValue;
+    engine_stop(eng);
+    return R_NilValue;
+}
+
+SEXP engine_push_tick_R(SEXP xptr, SEXP i_1b, SEXP j_1b, SEXP bid, SEXP ask)
+{
+    engine_t *eng = (engine_t *)R_ExternalPtrAddr(xptr);
+    if (!eng)
+        error("engine ptr is null");
+
+    if (!isInteger(i_1b) || LENGTH(i_1b) != 1)
+        error("i_1b must be integer(1)");
+    if (!isInteger(j_1b) || LENGTH(j_1b) != 1)
+        error("j_1b must be integer(1)");
+    if (!isReal(bid) || LENGTH(bid) != 1)
+        error("bid must be double(1)");
+    if (!isReal(ask) || LENGTH(ask) != 1)
+        error("ask must be double(1)");
+
+    int i = INTEGER(i_1b)[0];
+    int j = INTEGER(j_1b)[0];
+    double b = REAL(bid)[0];
+    double a = REAL(ask)[0];
+
+    return ScalarLogical(engine_push_tick(eng, i, j, b, a) ? 1 : 0);
+}
+
+SEXP engine_poll(SEXP xptr)
+{
+    engine_t *eng = (engine_t *)R_ExternalPtrAddr(xptr);
+    if (!eng)
+        error("engine ptr is null");
+
+    // dynamic accumulate
+    size_t cap = 1024, n = 0;
+    int *route_id = (int *)malloc(cap * sizeof(int));
+    int *mid_i = (int *)malloc(cap * sizeof(int));
+    int *end_i = (int *)malloc(cap * sizeof(int));
+    double *pnl = (double *)malloc(cap * sizeof(double));
+    double *edge = (double *)malloc(cap * sizeof(double));
+    double *fin = (double *)malloc(cap * sizeof(double));
+    double *pct = (double *)malloc(cap * sizeof(double));
+    double *ts = (double *)malloc(cap * sizeof(double));
+
+    if (!route_id || !mid_i || !end_i || !pnl || !edge || !fin || !pct || !ts)
+    {
+        free(route_id);
+        free(mid_i);
+        free(end_i);
+        free(pnl);
+        free(edge);
+        free(fin);
+        free(pct);
+        free(ts);
+        error("malloc failed");
+    }
+
+    result_t r;
+    while (engine_pop_result(eng, &r))
+    {
+        if (n == cap)
+        {
+            cap *= 2;
+            route_id = (int *)realloc(route_id, cap * sizeof(int));
+            mid_i = (int *)realloc(mid_i, cap * sizeof(int));
+            end_i = (int *)realloc(end_i, cap * sizeof(int));
+            pnl = (double *)realloc(pnl, cap * sizeof(double));
+            edge = (double *)realloc(edge, cap * sizeof(double));
+            fin = (double *)realloc(fin, cap * sizeof(double));
+            pct = (double *)realloc(pct, cap * sizeof(double));
+            ts = (double *)realloc(ts, cap * sizeof(double));
+            if (!route_id || !mid_i || !end_i || !pnl || !edge || !fin || !pct || !ts)
+                error("realloc failed");
+        }
+        route_id[n] = r.route_id;
+        mid_i[n] = r.mid_i;
+        end_i[n] = r.end_i;
+        pnl[n] = r.pnl;
+        edge[n] = r.edge;
+        fin[n] = r.final_base;
+        pct[n] = r.pct;
+        ts[n] = (double)r.ts_ns;
+        n++;
+    }
+
+    SEXP Route = PROTECT(allocVector(INTSXP, (R_xlen_t)n));
+    SEXP Mid = PROTECT(allocVector(INTSXP, (R_xlen_t)n));
+    SEXP End = PROTECT(allocVector(INTSXP, (R_xlen_t)n));
+    SEXP Pnl = PROTECT(allocVector(REALSXP, (R_xlen_t)n));
+    SEXP Edge = PROTECT(allocVector(REALSXP, (R_xlen_t)n));
+    SEXP Fin = PROTECT(allocVector(REALSXP, (R_xlen_t)n));
+    SEXP Pct = PROTECT(allocVector(REALSXP, (R_xlen_t)n));
+    SEXP Ts = PROTECT(allocVector(REALSXP, (R_xlen_t)n));
+
+    for (size_t i = 0; i < n; ++i)
+    {
+        INTEGER(Route)
+        [i] = route_id[i];
+        INTEGER(Mid)
+        [i] = mid_i[i];
+        INTEGER(End)
+        [i] = end_i[i];
+        REAL(Pnl)
+        [i] = pnl[i];
+        REAL(Edge)
+        [i] = edge[i];
+        REAL(Fin)
+        [i] = fin[i];
+        REAL(Pct)
+        [i] = pct[i];
+        REAL(Ts)
+        [i] = ts[i];
+    }
+
+    free(route_id);
+    free(mid_i);
+    free(end_i);
+    free(pnl);
+    free(edge);
+    free(fin);
+    free(pct);
+    free(ts);
+
+    SEXP df = PROTECT(allocVector(VECSXP, 8));
+    SET_VECTOR_ELT(df, 0, Route);
+    SET_VECTOR_ELT(df, 1, Mid);
+    SET_VECTOR_ELT(df, 2, End);
+    SET_VECTOR_ELT(df, 3, Pnl);
+    SET_VECTOR_ELT(df, 4, Edge);
+    SET_VECTOR_ELT(df, 5, Fin);
+    SET_VECTOR_ELT(df, 6, Pct);
+    SET_VECTOR_ELT(df, 7, Ts);
+
+    SEXP names = PROTECT(allocVector(STRSXP, 8));
+    SET_STRING_ELT(names, 0, mkChar("route_id"));
+    SET_STRING_ELT(names, 1, mkChar("mid"));
+    SET_STRING_ELT(names, 2, mkChar("end"));
+    SET_STRING_ELT(names, 3, mkChar("pnl"));
+    SET_STRING_ELT(names, 4, mkChar("edge"));
+    SET_STRING_ELT(names, 5, mkChar("final_base"));
+    SET_STRING_ELT(names, 6, mkChar("pct"));
+    SET_STRING_ELT(names, 7, mkChar("ts_ns"));
+    setAttrib(df, R_NamesSymbol, names);
+
+    SEXP rownames = PROTECT(allocVector(INTSXP, 2));
+    INTEGER(rownames)
+    [0] = NA_INTEGER;
+    INTEGER(rownames)
+    [1] = (int)n;
+    setAttrib(df, R_RowNamesSymbol, rownames);
+
+    setAttrib(df, R_ClassSymbol, mkString("data.frame"));
+
+    UNPROTECT(11);
+    return df;
+}
+#include <R_ext/Rdynload.h>
+
+static const R_CallMethodDef callMethods[] = {
+    {"engine_create", (DL_FUNC)&engine_create, 3},
+    {"engine_start_R", (DL_FUNC)&engine_start_R, 1},
+    {"engine_stop_R", (DL_FUNC)&engine_stop_R, 1},
+    {"engine_push_tick_R", (DL_FUNC)&engine_push_tick_R, 5},
+    {"engine_poll", (DL_FUNC)&engine_poll, 1},
+    {NULL, NULL, 0}};
+
+void R_init_engine_v4(DllInfo *dll)
+{
+    R_registerRoutines(dll, NULL, callMethods, NULL, NULL);
+    R_useDynamicSymbols(dll, FALSE);
+}
+
+
+========================================
+FILE: engine.c
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/engine.c
+========================================
+#include "engine.h"
+#include "matrix.h"
+#include "ringbuffer.h"
+#include "routes.h"
+
+#include <pthread.h>
+#include <stdatomic.h>
+#include <stdlib.h>
+#include <string.h>
+#include <math.h>
+#include <time.h>
+
+// Fixed ring sizes (A: fixed lock-free ringbuffer)
+RB_DEFINE(tick_rb_t, tick_t, 8192)
+RB_DEFINE(result_rb_t, result_t, 8192)
+
+struct engine_t
+{
+    int n_ccy;
+    int start0; // 0-based
+
+    matrix_t mat;
+    routes_t routes;
+
+    // Threading
+    _Atomic int running;
+    pthread_t thread;
+
+    // Buffers
+    tick_rb_t tick_rb;
+    result_rb_t result_rb;
+
+    // Telemetry
+    uint64_t ticks_received;
+    uint64_t ticks_dropped;
+    uint64_t results_emitted;
+    uint64_t results_dropped;
+
+    // scratch (avoid malloc each eval)
+    double start_qty;
+};
+
+// ---------- Engine core math ----------
+// TRI semantics matches din gamle engine:
+// qty_mid = start_qty / ASK[start, mid]
+// qty_end = qty_mid / ASK[mid, end]
+// final   = qty_end * BID[end, start]
+static inline int tri_simulate(const matrix_t *mat, int start0, int mid0, int end0,
+                               double start_qty,
+                               double *final_base, double *edge_out, double *pnl_out)
+{
+    size_t idx1 = matrix_idx(mat, start0, mid0);
+    size_t idx2 = matrix_idx(mat, mid0, end0);
+    size_t idx3 = matrix_idx(mat, end0, start0);
+
+    double ask1 = mat->ASK[idx1];
+    if (!(ask1 > 0.0) || !isfinite(ask1))
+        return 0;
+    double qty_mid = start_qty / ask1;
+
+    double ask2 = mat->ASK[idx2];
+    if (!(ask2 > 0.0) || !isfinite(ask2))
+        return 0;
+    double qty_end = qty_mid / ask2;
+
+    double bid3 = mat->BID[idx3];
+    if (!(bid3 > 0.0) || !isfinite(bid3))
+        return 0;
+
+    double fin = qty_end * bid3;
+    double pnl = fin - start_qty;
+    double edge = (fin / start_qty) - 1.0;
+
+    *final_base = fin;
+    *pnl_out = pnl;
+    *edge_out = edge;
+    return isfinite(pnl) ? 1 : 0;
+}
+
+static void eval_all_routes(engine_t *e)
+{
+    const int R = e->routes.n_routes;
+    const uint64_t ts = ticks_now_ns();
+
+    if (e->routes.kind == ROUTES_KIND_TRI)
+    {
+        int k = 0;
+        for (; k + 3 < R; k += 4)
+        {
+            for (int u = 0; u < 4; ++u)
+            {
+                int kk = k + u;
+                int mid0 = e->routes.mid0[kk];
+                int end0 = e->routes.end0[kk];
+
+                double fin, edge, pnl;
+                if (tri_simulate(&e->mat, e->start0, mid0, end0, e->start_qty, &fin, &edge, &pnl))
+                {
+                    result_t r;
+                    r.route_id = kk + 1;
+                    r.mid_i = mid0 + 1;
+                    r.end_i = end0 + 1;
+                    r.final_base = fin;
+                    r.edge = edge;
+                    r.pnl = pnl;
+                    r.pct = (pnl / e->start_qty) * 100.0;
+                    r.ts_ns = ts;
+                    if (result_rb_t_push(&e->result_rb, &r))
+                    {
+                        e->results_emitted++;
+                    }
+                    else
+                    {
+                        e->results_dropped++;
+                    }
+                }
+            }
+        }
+        for (; k < R; ++k)
+        {
+            int mid0 = e->routes.mid0[k];
+            int end0 = e->routes.end0[k];
+
+            double fin, edge, pnl;
+            if (tri_simulate(&e->mat, e->start0, mid0, end0, e->start_qty, &fin, &edge, &pnl))
+            {
+                result_t r;
+                r.route_id = k + 1;
+                r.mid_i = mid0 + 1;
+                r.end_i = end0 + 1;
+                r.final_base = fin;
+                r.edge = edge;
+                r.pnl = pnl;
+                r.pct = (pnl / e->start_qty) * 100.0;
+                r.ts_ns = ts;
+                if (result_rb_t_push(&e->result_rb, &r))
+                {
+                    e->results_emitted++;
+                }
+                else
+                {
+                    e->results_dropped++;
+                }
+            }
+        }
+        return;
+    }
+
+    if (e->routes.kind == ROUTES_KIND_CYCLE)
+    {
+        const int n_cols = e->routes.n_cols;
+        const int n_legs = n_cols - 1;
+
+        for (int route = 0; route < R; ++route)
+        {
+            const int *row = &e->routes.nodes0[(size_t)route * (size_t)n_cols];
+
+            double qty = e->start_qty;
+            int ok = 1;
+
+            for (int leg = 0; leg < n_legs - 1; ++leg)
+            {
+                int a = row[leg];
+                int b = row[leg + 1];
+                double ask = e->mat.ASK[matrix_idx(&e->mat, a, b)];
+                if (!(ask > 0.0) || !isfinite(ask))
+                {
+                    ok = 0;
+                    break;
+                }
+                qty = qty / ask;
+            }
+            if (!ok)
+                continue;
+
+            int last = row[n_legs - 1];
+            int back = row[n_legs];
+            double bid = e->mat.BID[matrix_idx(&e->mat, last, back)];
+            if (!(bid > 0.0) || !isfinite(bid))
+                continue;
+
+            double fin = qty * bid;
+            double pnl = fin - e->start_qty;
+            if (!isfinite(pnl))
+                continue;
+
+            result_t r;
+            r.route_id = route + 1;
+            r.mid_i = 0;
+            r.end_i = 0;
+            r.final_base = fin;
+            r.edge = (fin / e->start_qty) - 1.0;
+            r.pnl = pnl;
+            r.pct = (pnl / e->start_qty) * 100.0;
+            r.ts_ns = ts;
+            if (result_rb_t_push(&e->result_rb, &r))
+            {
+                e->results_emitted++;
+            }
+            else
+            {
+                e->results_dropped++;
+            }
+        }
+    }
+}
+
+static void *engine_thread_main(void *p)
+{
+    engine_t *e = (engine_t *)p;
+
+    while (atomic_load(&e->running))
+    {
+        tick_t t;
+        int got = tick_rb_t_pop(&e->tick_rb, &t);
+        if (!got)
+        {
+            struct timespec req;
+            req.tv_sec = 0;
+            req.tv_nsec = 200000; // 0.2 ms
+            nanosleep(&req, NULL);
+            continue;
+        }
+
+        int i0 = t.i_1b - 1;
+        int j0 = t.j_1b - 1;
+        matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask);
+
+        while (tick_rb_t_pop(&e->tick_rb, &t))
+        {
+            i0 = t.i_1b - 1;
+            j0 = t.j_1b - 1;
+            matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask);
+        }
+
+        eval_all_routes(e);
+    }
+    return NULL;
+}
+
+// ---------- Public API ----------
+static engine_t *engine_alloc_common(int n_ccy, int start_i_1b)
+{
+    if (n_ccy <= 1)
+        return NULL;
+    if (start_i_1b < 1 || start_i_1b > n_ccy)
+        return NULL;
+
+    engine_t *e = (engine_t *)calloc(1, sizeof(engine_t));
+    if (!e)
+        return NULL;
+
+    e->n_ccy = n_ccy;
+    e->start0 = start_i_1b - 1;
+    e->start_qty = 100000.0;
+
+    e->ticks_received  = 0;
+    e->ticks_dropped   = 0;
+    e->results_emitted = 0;
+    e->results_dropped = 0;
+
+    if (!matrix_init(&e->mat, n_ccy))
+    {
+        free(e);
+        return NULL;
+    }
+
+    tick_rb_t_init(&e->tick_rb);
+    result_rb_t_init(&e->result_rb);
+    atomic_store(&e->running, 0);
+    return e;
+}
+
+engine_t *engine_create_tri(int n_ccy, int start_i_1b,
+                            const int *mid_end_rowmajor, int n_routes,
+                            int one_based)
+{
+    engine_t *e = engine_alloc_common(n_ccy, start_i_1b);
+    if (!e)
+        return NULL;
+
+    if (!routes_init_tri(&e->routes, mid_end_rowmajor, n_routes, one_based))
+    {
+        engine_destroy(e);
+        return NULL;
+    }
+    return e;
+}
+
+engine_t *engine_create_cycle(int n_ccy, int start_i_1b,
+                              const int *nodes_rowmajor, int n_routes, int n_cols,
+                              int one_based)
+{
+    engine_t *e = engine_alloc_common(n_ccy, start_i_1b);
+    if (!e)
+        return NULL;
+
+    if (!routes_init_cycle(&e->routes, nodes_rowmajor, n_routes, n_cols, one_based))
+    {
+        engine_destroy(e);
+        return NULL;
+    }
+    return e;
+}
+
+void engine_destroy(engine_t *e)
+{
+    if (!e)
+        return;
+    engine_stop(e);
+    routes_free(&e->routes);
+    matrix_free(&e->mat);
+    free(e);
+}
+
+int engine_start(engine_t *e)
+{
+    if (!e)
+        return 0;
+
+    int expected = 0;
+    if (!atomic_compare_exchange_strong(&e->running, &expected, 1))
+        return 1;
+
+    if (pthread_create(&e->thread, NULL, engine_thread_main, e) != 0)
+    {
+        atomic_store(&e->running, 0); // viktig fix
+        return 0;
+    }
+    return 1;
+}
+
+void engine_stop(engine_t *e)
+{
+    if (!e)
+        return;
+    if (atomic_exchange(&e->running, 0))
+    {
+        (void)pthread_join(e->thread, NULL);
+    }
+}
+
+int engine_push_tick(engine_t *e, int i_1b, int j_1b, double bid, double ask)
+{
+    if (!e)
+        return 0;
+
+    tick_t t;
+    t.i_1b = i_1b;
+    t.j_1b = j_1b;
+    t.bid = bid;
+    t.ask = ask;
+    t.ts_ns = ticks_now_ns();
+
+    int ok = tick_rb_t_push(&e->tick_rb, &t);
+    if (ok) {
+        e->ticks_received++;
+    } else {
+        e->ticks_dropped++;
+    }
+    return ok;
+}
+int engine_pop_result(engine_t *e, result_t *out)
+{
+    if (!e || !out)
+        return 0;
+    return result_rb_t_pop(&e->result_rb, out);
+}
+
+
+========================================
+FILE: engine.h
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/engine.h
+========================================
+#pragma once
+#include <stdint.h>
+#include "ticks.h"
+#include "results.h"
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    typedef struct engine_t engine_t;
+
+    // Constructors
+    engine_t *engine_create_tri(int n_ccy, int start_i_1b,
+                                const int *mid_end_rowmajor, int n_routes,
+                                int one_based);
+
+    engine_t *engine_create_cycle(int n_ccy, int start_i_1b,
+                                  const int *nodes_rowmajor, int n_routes, int n_cols,
+                                  int one_based);
+
+    // Lifecycle
+    void engine_destroy(engine_t *e);
+
+    // Thread control
+    int engine_start(engine_t *e);
+    void engine_stop(engine_t *e);
+
+    // Feed ticks
+    int engine_push_tick(engine_t *e, int i_1b, int j_1b, double bid, double ask);
+
+    // Pop results (non-blocking): returns 1 if popped, else 0
+    int engine_pop_result(engine_t *e, result_t *out);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+========================================
+FILE: funksjoner.rb
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/funksjoner.rb
+========================================
+engine_load
+precompute_route_idx
+.engine_push_mats
+engine_push_tick
+engine_init
+engine_refresh_mats
+engine_reinit_if_needed
+engine_poll_df
+engine_tick_eval
+engine_wrappers_ready
+engine_push_tick
+
+
+========================================
+FILE: matrix.c
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/matrix.c
+========================================
+#include "matrix.h"
+#include <stdlib.h>
+#include <string.h>
+
+static void *aligned_malloc64(size_t bytes)
+{
+    void *p = NULL;
+    // posix_memalign works well on macOS
+    if (posix_memalign(&p, 64, bytes) != 0)
+        return NULL;
+    return p;
+}
+
+int matrix_init(matrix_t *m, int n)
+{
+    if (!m || n <= 1)
+        return 0;
+    m->n = n;
+
+    size_t N = (size_t)n * (size_t)n;
+    size_t bytes = N * sizeof(double);
+
+    m->M = (double *)aligned_malloc64(bytes);
+    m->BID = (double *)aligned_malloc64(bytes);
+    m->ASK = (double *)aligned_malloc64(bytes);
+    if (!m->M || !m->BID || !m->ASK)
+    {
+        matrix_free(m);
+        return 0;
+    }
+
+    memset(m->M, 0, bytes);
+    memset(m->BID, 0, bytes);
+    memset(m->ASK, 0, bytes);
+    return 1;
+}
+
+void matrix_free(matrix_t *m)
+{
+    if (!m)
+        return;
+    free(m->M);
+    m->M = NULL;
+    free(m->BID);
+    m->BID = NULL;
+    free(m->ASK);
+    m->ASK = NULL;
+    m->n = 0;
+}
+
+
+========================================
+FILE: matrix.h
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/matrix.h
+========================================
+#pragma once
+#include <stddef.h>
+#include <math.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    typedef struct matrix_t
+    {
+        int n;
+        double *M;
+        double *BID;
+        double *ASK;
+    } matrix_t;
+
+    int matrix_init(matrix_t *m, int n);
+    void matrix_free(matrix_t *m);
+
+    static inline size_t matrix_idx(const matrix_t *m, int i0, int j0)
+    {
+        return (size_t)i0 * (size_t)m->n + (size_t)j0;
+    }
+
+    static inline void matrix_update_pair(matrix_t *m, int i0, int j0, double bid, double ask)
+    {
+        size_t k = matrix_idx(m, i0, j0);
+        m->BID[k] = bid;
+        m->ASK[k] = ask;
+
+        if (bid > 0.0 && ask > 0.0)
+        {
+            double x = bid * ask;
+            m->M[k] = (x > 0.0) ? sqrt(x) : 0.0;
+        }
+        else
+        {
+            m->M[k] = 0.0;
+        }
+    }
+
+#ifdef __cplusplus
+}
+#endif
+
+
+========================================
+FILE: results.h
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/results.h
+========================================
+#pragma once
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    typedef struct result_t
+    {
+        int route_id; // 1-based
+        int mid_i;    // 1-based (for tri routes; 0 if N-leg not representable)
+        int end_i;    // 1-based (for tri routes; 0 if N-leg not representable)
+        double edge;
+        double final_base;
+        double pnl;
+        double pct;
+        uint64_t ts_ns;
+    } result_t;
+
+#ifdef __cplusplus
+}
+#endif
+
+
+========================================
+FILE: ringbuffer.h
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/ringbuffer.h
+========================================
+#pragma once
+#include <stddef.h>
+#include <stdatomic.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+// SPSC ringbuffer (single-producer, single-consumer)
+// Capacity is N, but usable slots are N-1 (classic ring).
+#define RB_DEFINE(name, type, N)                                               \
+    typedef struct name                                                        \
+    {                                                                          \
+        type buffer[(N)];                                                      \
+        atomic_size_t head;                                                    \
+        atomic_size_t tail;                                                    \
+    } name;                                                                    \
+                                                                               \
+    static inline void name##_init(name *rb)                                   \
+    {                                                                          \
+        atomic_init(&rb->head, 0);                                             \
+        atomic_init(&rb->tail, 0);                                             \
+    }                                                                          \
+                                                                               \
+    static inline int name##_push(name *rb, const type *v)                     \
+    {                                                                          \
+        size_t h = atomic_load_explicit(&rb->head, memory_order_relaxed);      \
+        size_t n = (h + 1) % (N);                                              \
+        size_t t = atomic_load_explicit(&rb->tail, memory_order_acquire);      \
+        if (n == t)                                                            \
+            return 0;                                                          \
+        rb->buffer[h] = *v;                                                    \
+        atomic_store_explicit(&rb->head, n, memory_order_release);             \
+        return 1;                                                              \
+    }                                                                          \
+                                                                               \
+    static inline int name##_pop(name *rb, type *out)                          \
+    {                                                                          \
+        size_t t = atomic_load_explicit(&rb->tail, memory_order_relaxed);      \
+        size_t h = atomic_load_explicit(&rb->head, memory_order_acquire);      \
+        if (t == h)                                                            \
+            return 0;                                                          \
+        *out = rb->buffer[t];                                                  \
+        atomic_store_explicit(&rb->tail, (t + 1) % (N), memory_order_release); \
+        return 1;                                                              \
+    }
+
+#ifdef __cplusplus
+}
+#endif
+
+
+========================================
+FILE: routes.c
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/routes.c
+========================================
+#include "routes.h"
+#include <stdlib.h>
+#include <string.h>
+
+void routes_free(routes_t *r)
+{
+    if (!r)
+        return;
+    free(r->mid0);
+    r->mid0 = NULL;
+    free(r->end0);
+    r->end0 = NULL;
+    free(r->nodes0);
+    r->nodes0 = NULL;
+    r->n_routes = 0;
+    r->n_cols = 0;
+    r->kind = 0;
+}
+
+int routes_init_tri(routes_t *r, const int *input_mid_end, int n_routes, int one_based)
+{
+    if (!r || !input_mid_end || n_routes <= 0)
+        return 0;
+    memset(r, 0, sizeof(*r));
+    r->kind = ROUTES_KIND_TRI;
+    r->n_routes = n_routes;
+
+    r->mid0 = (int *)malloc((size_t)n_routes * sizeof(int));
+    r->end0 = (int *)malloc((size_t)n_routes * sizeof(int));
+    if (!r->mid0 || !r->end0)
+    {
+        routes_free(r);
+        return 0;
+    }
+
+    for (int k = 0; k < n_routes; ++k)
+    {
+        int mid = input_mid_end[2 * k + 0];
+        int end = input_mid_end[2 * k + 1];
+        if (one_based)
+        {
+            mid--;
+            end--;
+        }
+        r->mid0[k] = mid;
+        r->end0[k] = end;
+    }
+    return 1;
+}
+
+int routes_init_cycle(routes_t *r, const int *nodes, int n_routes, int n_cols, int one_based)
+{
+    if (!r || !nodes || n_routes <= 0 || n_cols < 2)
+        return 0;
+    memset(r, 0, sizeof(*r));
+    r->kind = ROUTES_KIND_CYCLE;
+    r->n_routes = n_routes;
+    r->n_cols = n_cols;
+
+    size_t L = (size_t)n_routes * (size_t)n_cols;
+    r->nodes0 = (int *)malloc(L * sizeof(int));
+    if (!r->nodes0)
+    {
+        routes_free(r);
+        return 0;
+    }
+
+    for (size_t i = 0; i < L; ++i)
+    {
+        int v = nodes[i];
+        if (one_based)
+            v--;
+        r->nodes0[i] = v;
+    }
+    return 1;
+}
+
+
+========================================
+FILE: routes.h
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/routes.h
+========================================
+#pragma once
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    typedef enum routes_kind_t
+    {
+        ROUTES_KIND_TRI = 1,  // routes are (mid,end)
+        ROUTES_KIND_CYCLE = 2 // general cycle nodes (N legs)
+    } routes_kind_t;
+
+    typedef struct routes_t
+    {
+        routes_kind_t kind;
+        int n_routes;
+
+        // TRI fast-path:
+        int *mid0; // 0-based
+        int *end0; // 0-based
+
+        // General cycle:
+        int n_cols;  // nodes per route row (>=2). legs = n_cols-1
+        int *nodes0; // row-major, 0-based indices, length n_routes*n_cols
+    } routes_t;
+
+    void routes_free(routes_t *r);
+
+    // Create TRI from mid/end row-major.
+    // input_mid_end: length n_routes*2
+    int routes_init_tri(routes_t *r, const int *input_mid_end, int n_routes, int one_based);
+
+    // Create cycle from nodes row-major.
+    // nodes: length n_routes*n_cols; columns = nodes per route (n_legs+1)
+    // If one_based=1, converts to 0-based.
+    int routes_init_cycle(routes_t *r, const int *nodes, int n_routes, int n_cols, int one_based);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+========================================
+FILE: Samle all kode i mappen.r
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/Samle all kode i mappen.r
+========================================
+DIR_PATH <- "/Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++"
+
+combine_all_sources <- function(dir = DIR_PATH,
+                                output = "ALL_CODE.txt") {
+    # Finn ALLE entries i mappen
+    entries <- list.files(dir, full.names = TRUE, recursive = FALSE)
+
+    # Filtrer ut mapper
+    files <- entries[file.info(entries)$isdir == FALSE]
+
+    # Filtrer også ut output-filen slik at den ikke slukes av seg selv
+    files <- files[basename(files) != output]
+
+    if (!length(files)) stop("Ingen filer funnet i mappen.")
+
+    # Funksjon for å sjekke om filen er tekst (ikke binær)
+    is_text_file <- function(path) {
+        con <- file(path, "rb")
+        on.exit(close(con))
+        raw <- readBin(con, what = "raw", n = 2000)
+        !any(raw == as.raw(0))
+    }
+
+    out_lines <- c()
+
+    for (f in files) {
+        if (!is_text_file(f)) {
+            message(sprintf("⚠️ Hopper over binær fil: %s", basename(f)))
+            next
+        }
+
+        message(sprintf("📄 Leser: %s", basename(f)))
+
+        content <- readLines(f, warn = FALSE)
+
+        block <- c(
+            "",
+            "========================================",
+            paste0("FILE: ", basename(f)),
+            paste0("PATH: ", f),
+            "========================================",
+            content,
+            ""
+        )
+
+        out_lines <- c(out_lines, block)
+    }
+
+    writeLines(out_lines, con = file.path(dir, output))
+    message(sprintf(
+        "\n✅ Ferdig! ALL_CODE.txt lagret i:\n%s/%s",
+        dir, output
+    ))
+
+    invisible(TRUE)
+}
+combine_all_sources()
+
+
+========================================
+FILE: test_engine.py
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/test_engine.py
+========================================
+#!/usr/bin/env python3
+# test_engine.py — kjør fra katalogen som inneholder engine_py.py og libengine_v4.dylib
+
+from engine_py import Engine
+import time
+import os, sys
+
+print("cwd:", os.getcwd())
+print("engine_py exists:", os.path.exists(os.path.join(os.getcwd(), "engine_py.py")))
+print("lib exists:", os.path.exists(os.path.join(os.getcwd(), "libengine_v4.dylib")))
+
+try:
+    eng = Engine(n_ccy=4, start_i_1b=1, routes_mid_end_1b=[(2,3)])
+except Exception as e:
+    print("FEIL ved opprettelse av Engine:", e)
+    sys.exit(1)
+
+started = eng.start()
+print("started:", started)
+
+# Push syntetiske ticks (bid, ask)
+eng.push_tick(1, 2, 0.0, 1.1)   # start->mid : ask=1.1
+eng.push_tick(2, 3, 0.0, 1.1)   # mid->end   : ask=1.1
+eng.push_tick(3, 1, 1.25, 0.0)  # end->start : bid=1.25
+
+time.sleep(0.05)   # gi motoren litt tid
+print("poll:", eng.poll())
+
+eng.stop()
+eng.destroy()
+
+
+========================================
+FILE: ticks.c
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/ticks.c
+========================================
+#include "ticks.h"
+
+#if defined(__APPLE__)
+#include <mach/mach_time.h>
+uint64_t ticks_now_ns(void)
+{
+    static mach_timebase_info_data_t tb = {0, 0};
+    if (tb.denom == 0)
+        (void)mach_timebase_info(&tb);
+    uint64_t t = mach_absolute_time();
+    // ns = t * numer/denom
+    return (t * (uint64_t)tb.numer) / (uint64_t)tb.denom;
+}
+#else
+#include <time.h>
+uint64_t ticks_now_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
+
+
+========================================
+FILE: ticks.h
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/ticks.h
+========================================
+#pragma once
+#include <stdint.h>
+
+#ifdef __cplusplus
+extern "C"
+{
+#endif
+
+    typedef struct tick_t
+    {
+        int i_1b;
+        int j_1b;
+        double bid;
+        double ask;
+        uint64_t ts_ns;
+    } tick_t;
+
+    uint64_t ticks_now_ns(void);
+
+#ifdef __cplusplus
+}
+#endif
+
+
+========================================
+FILE: v4 engine wrappers ussiker1r
+PATH: /Users/sigurdberner/FX_ARBITRAGE_FINALE copy/C++/v4 engine wrappers ussiker1r
+========================================
+
+# ============================================================
+#  ENGINE WRAPPER FOR ENGINE v4 (TRI + CYCLE)
+#  Komplett, korrekt og matchet til C-koden du ga meg
+# ============================================================
+
+# -----------------------------
+# Load the shared library
+# -----------------------------
+engine_load <- function(path) {
+  path <- normalizePath(path, mustWork = TRUE)
+  dyn.load(path)
+  invisible(TRUE)
+}
+
+# -----------------------------
+# Create engine
+# -----------------------------
+engine_create <- function(routes_matrix, start_ccy_index, n_ccy) {
+  stopifnot(is.matrix(routes_matrix))
+  stopifnot(is.integer(routes_matrix))
+  stopifnot(length(start_ccy_index) == 1L)
+  stopifnot(length(n_ccy) == 1L)
+
+  .Call(
+    "engine_create",
+    routes_matrix,
+    as.integer(start_ccy_index),
+    as.integer(n_ccy)
+  )
+}
+
+# -----------------------------
+# Start engine thread
+# -----------------------------
+engine_start <- function(ptr) {
+  .Call("engine_start_R", ptr)
+}
+
+# -----------------------------
+# Stop engine
+# -----------------------------
+engine_stop <- function(ptr) {
+  .Call("engine_stop_R", ptr)
+}
+
+# -----------------------------
+# Push a single tick
+# -----------------------------
+engine_push_tick <- function(ptr, i, j, bid, ask) {
+  .Call(
+    "engine_push_tick_R",
+    ptr,
+    as.integer(i),
+    as.integer(j),
+    as.numeric(bid),
+    as.numeric(ask)
+  )
+}
+
+# -----------------------------
+# Fill engine with full matrix
+# -----------------------------
+engine_push_full <- function(ptr, M, BID, ASK) {
+  n <- nrow(M)
+  for (i in seq_len(n)) {
+    for (j in seq_len(n)) {
+      b <- BID[i, j]
+      a <- ASK[i, j]
+      if (is.finite(b) && is.finite(a) && b > 0 && a > 0) {
+        engine_push_tick(ptr, i, j, b, a)
+      }
+    }
+  }
+  invisible(TRUE)
+}
+
+# -----------------------------
+# Poll all results at once
+# -----------------------------
+engine_poll <- function(ptr) {
+  .Call("engine_poll", ptr)
+}
+
+# -----------------------------
+# Helper: build TRI routes
+# (1-based mid/end)
+# -----------------------------
+build_tri_routes <- function(ccys, start_ccy) {
+  s <- match(start_ccy, ccys)
+  idx <- setdiff(seq_along(ccys), s)
+
+  g <- expand.grid(mid = idx, end = idx)
+  g <- g[g$mid != g$end, ]
+
+  routes <- as.matrix(g)
+  storage.mode(routes) <- "integer"
+  routes
+}
+
+# -----------------------------
+# Full initializer
+# (state$ccys, state$M/BID/ASK already exist)
+# -----------------------------
+engine_init <- function(state, start_ccy) {
+
+  start_i <- match(start_ccy, state$ccys)
+  if (is.na(start_i)) stop("start_ccy not in state$ccys")
+
+  # Build triangular routes
+  routes <- build_tri_routes(state$ccys, start_ccy)
+
+  state$routes <- routes
+
+  # Create engine in C
+  state$eng <- engine_create(
+    routes_matrix = routes, 
+    start_ccy_index = start_i,
+    n_ccy = length(state$ccys)
+  )
+
+  # Push initial matrices
+  engine_push_full(state$eng, state$M, state$BID, state$ASK)
+
+  # Start computation thread
+  engine_start(state$eng)
+
+  state
+}
+

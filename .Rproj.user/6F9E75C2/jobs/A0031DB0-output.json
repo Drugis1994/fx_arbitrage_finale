@@ -1,0 +1,6 @@
+[1,"Installing 'moments' ...\n"]
+[2,"trying URL 'https://cran.rstudio.com/bin/macosx/big-sur-arm64/contrib/4.4/moments_0.14.1.tgz'\n"]
+[2,"Content type 'application/x-gzip' length 54500 bytes (53 KB)\n============================="]
+[1,"The downloaded binary packages are in\n"]
+[1,"\t/var/folders/cb/mdjggtdx5lbfdj_p777_qd6c0000gn/T//RtmpanjFI7/downloaded_packages\n"]
+[2,"=====================\ndownloaded 53 KB\n\n\n\n✔ Package 'moments' successfully installed.\n"]

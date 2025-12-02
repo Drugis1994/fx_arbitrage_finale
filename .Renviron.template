@@ -1,0 +1,4 @@
+# Copy this file to ~/.Renviron or project root as .Renviron
+OANDA_API_TOKEN=YOUR_TOKEN_HERE
+OANDA_ACCOUNT_ID=YOUR_ACCOUNT_ID
+OANDA_BASE_URL=https://api-fxpractice.oanda.com/v3

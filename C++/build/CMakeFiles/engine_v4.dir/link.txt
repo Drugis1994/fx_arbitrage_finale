@@ -1,0 +1,1 @@
+/usr/bin/cc  -arch arm64 -Wl,-undefined,dynamic_lookup -dynamiclib -Wl,-headerpad_max_install_names -o libengine_v4.dylib -install_name @rpath/libengine_v4.dylib CMakeFiles/engine_v4.dir/engine.c.o CMakeFiles/engine_v4.dir/engine_R.c.o CMakeFiles/engine_v4.dir/routes.c.o CMakeFiles/engine_v4.dir/matrix.c.o CMakeFiles/engine_v4.dir/ticks.c.o
