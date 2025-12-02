@@ -19,9 +19,12 @@ suppressWarnings({
 
 # --- Project root ---
 Sys.setenv(CURL_DNS_SERVERS = "1.1.1.1,8.8.8.8")
-setwd("/Users/sigurdberner/FX_ARBITRAGE_FINALE copy")
-ROOT <- "/Users/sigurdberner/FX_ARBITRAGE_FINALE copy"
-readRenviron(file.path(ROOT, ".env"))
+
+ROOT <- normalizePath(Sys.getenv("FX_ARBITRAGE_ROOT", unset = getwd()))
+setwd(ROOT)
+
+env_path <- file.path(ROOT, ".env")
+if (file.exists(env_path)) readRenviron(env_path)
 
 `%||%` <- function(x, y) if (is.null(x)) y else x
 
@@ -46,7 +49,7 @@ options(
 # --- Load core files ---
 source(file.path(ROOT, "R/core_runtime.R"))
 source(file.path(ROOT, "R/DirectStream.R"))
-source(file.path(ROOT, "R/Trading_Bot.R"))
+source(file.path(ROOT, "R/trading_bot.R"))
 source(file.path(ROOT, "R/Engine_Wrapper.R"))
 
 # --- Load C++ engine (minimal) ---
@@ -65,7 +68,7 @@ cat("🚀 Oppsett klart…\n")
 
 
 all_instr <- DS$list_symbols()
-STREAM_UNIVERSE <- (100L)
+STREAM_UNIVERSE <- as.character(all_instr)
 
 cat(sprintf("\n📦 Abonnerer på %d instrumenter:\n%s\n",
             length(STREAM_UNIVERSE),
