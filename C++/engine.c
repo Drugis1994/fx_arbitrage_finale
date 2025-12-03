@@ -11,8 +11,10 @@
 #include <time.h>
 
 // Fixed ring sizes (A: fixed lock-free ringbuffer)
-RB_DEFINE(tick_rb_t, tick_t, 8192)
-RB_DEFINE(result_rb_t, result_t, 8192)
+#define TICK_RB_CAPACITY 8192
+#define RESULT_RB_CAPACITY 8192
+RB_DEFINE(tick_rb_t, tick_t, TICK_RB_CAPACITY)
+RB_DEFINE(result_rb_t, result_t, RESULT_RB_CAPACITY)
 
 struct engine_t
 {
@@ -36,6 +38,8 @@ struct engine_t
     uint64_t results_emitted;
     uint64_t results_dropped;
 
+    uint64_t last_tick_ts_ns;
+
     // scratch (avoid malloc each eval)
     double start_qty;
 };
@@ -46,13 +50,34 @@ static inline int tick_payload_ok(const engine_t *e, int i_1b, int j_1b, double 
         return 0;
     if (i_1b < 1 || j_1b < 1 || i_1b > e->n_ccy || j_1b > e->n_ccy)
         return 0;
+    if (i_1b == j_1b)
+        return 0;
     if (!isfinite(bid) || !isfinite(ask))
         return 0;
     if (bid <= 0.0 || ask <= 0.0)
         return 0;
     if (ask < bid) // basic spread sanity check
         return 0;
+    double spread = ask - bid;
+    if (!isfinite(spread) || spread < 0.0)
+        return 0;
     return 1;
+}
+
+static inline size_t tick_rb_used(const tick_rb_t *rb)
+{
+    size_t h = atomic_load_explicit(&rb->head, memory_order_acquire);
+    size_t t = atomic_load_explicit(&rb->tail, memory_order_acquire);
+    if (h >= t)
+        return h - t;
+    return (size_t)TICK_RB_CAPACITY - (t - h);
+}
+
+static inline int tick_rb_has_capacity(const tick_rb_t *rb, size_t needed)
+{
+    const size_t usable = TICK_RB_CAPACITY - 1; // ringbuffer keeps one slot open
+    size_t used = tick_rb_used(rb);
+    return used + needed <= usable;
 }
 
 // ---------- Engine core math ----------
@@ -243,8 +268,20 @@ static void *engine_thread_main(void *p)
             continue;
         }
 
+        if (t.ts_ns != 0 && e->last_tick_ts_ns != 0 && t.ts_ns < e->last_tick_ts_ns)
+        {
+            e->ticks_dropped++;
+            continue;
+        }
+        e->last_tick_ts_ns = t.ts_ns;
+
         int i0 = t.i_1b - 1;
         int j0 = t.j_1b - 1;
+        if (!matrix_in_bounds(&e->mat, i0, j0))
+        {
+            e->ticks_dropped++;
+            continue;
+        }
         if (!matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask))
         {
             e->ticks_dropped++;
@@ -261,6 +298,11 @@ static void *engine_thread_main(void *p)
 
             i0 = t.i_1b - 1;
             j0 = t.j_1b - 1;
+            if (!matrix_in_bounds(&e->mat, i0, j0))
+            {
+                e->ticks_dropped++;
+                continue;
+            }
             if (!matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask))
             {
                 e->ticks_dropped++;
@@ -293,6 +335,7 @@ static engine_t *engine_alloc_common(int n_ccy, int start_i_1b)
     e->ticks_dropped   = 0;
     e->results_emitted = 0;
     e->results_dropped = 0;
+    e->last_tick_ts_ns = 0;
 
     if (!matrix_init(&e->mat, n_ccy))
     {
@@ -394,6 +437,12 @@ int engine_push_tick(engine_t *e, int i_1b, int j_1b, double bid, double ask)
     t.ts_ns = ticks_now_ns();
     if (t.ts_ns == 0)
         t.ts_ns = 1; // avoid zero timestamps
+
+    if (!tick_rb_has_capacity(&e->tick_rb, 1))
+    {
+        e->ticks_dropped++;
+        return 0;
+    }
 
     int ok = tick_rb_t_push(&e->tick_rb, &t);
     if (ok)

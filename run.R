@@ -45,7 +45,7 @@ suppressWarnings({
 # --- Project root ---
 Sys.setenv(CURL_DNS_SERVERS = "1.1.1.1,8.8.8.8")
 
-ROOT <- resolve_root()
+ROOT <- normalizePath(Sys.getenv("FX_ARBITRAGE_ROOT", unset = resolve_root()), mustWork = FALSE)
 setwd(ROOT)
 
 load_env_files(ROOT)
@@ -79,8 +79,9 @@ source(file.path(ROOT, "R/Engine_Wrapper.R"))
 engine_load <- function(path = NULL) {
   libname <- paste0("libengine_v4", .Platform$dynlib.ext)
   default_path <- file.path(ROOT, "C++", libname)
-  path <- path %||% default_path
-  p <- normalizePath(path, mustWork = TRUE)
+  env_path <- Sys.getenv("FX_ENGINE_LIB", unset = NA_character_)
+  chosen <- path %||% env_path %||% default_path
+  p <- normalizePath(chosen, mustWork = TRUE)
   if (!is.loaded("engine_poll_R")) dyn.load(p)
   invisible(TRUE)
 }
