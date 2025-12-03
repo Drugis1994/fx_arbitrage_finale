@@ -95,10 +95,14 @@ DS <- local({
         level = integer(), bid_price = numeric(), bid_size = numeric(),
         ask_price = numeric(), ask_size = numeric(), stringsAsFactors = FALSE
       )
-      return(list(frame = empty, arrays = list(
-        bid = list(price = numeric(), size = numeric()),
-        ask = list(price = numeric(), size = numeric())
-      )))
+      return(list(
+        frame = empty,
+        arrays = list(
+          level = integer(),
+          bid = list(price = numeric(), size = numeric()),
+          ask = list(price = numeric(), size = numeric())
+        )
+      ))
     }
 
     df <- as.data.frame(buckets)
@@ -120,6 +124,7 @@ DS <- local({
     list(
       frame = depth_df,
       arrays = list(
+        level = depth_df$level,
         bid = list(price = depth_df$bid_price, size = depth_df$bid_size),
         ask = list(price = depth_df$ask_price, size = depth_df$ask_size)
       )
@@ -134,14 +139,17 @@ DS <- local({
     l1_bid <- if (nrow(depth$frame) > 0) depth$frame$bid_price[[1]] else NA_real_
     l1_ask <- if (nrow(depth$frame) > 0) depth$frame$ask_price[[1]] else NA_real_
 
+    l1_depth <- list(
+      bid = list(price = l1_bid, size = depth$frame$bid_size[[1]] %||% NA_real_),
+      ask = list(price = l1_ask, size = depth$frame$ask_size[[1]] %||% NA_real_)
+    )
+
     list(
       instrument = instrument,
       timestamp = ts,
       provider = "oanda-practice",
-      l1 = list(
-        bid = list(price = l1_bid, size = depth$frame$bid_size[[1]] %||% NA_real_),
-        ask = list(price = l1_ask, size = depth$frame$ask_size[[1]] %||% NA_real_)
-      ),
+      l1 = l1_depth,
+      l2 = depth$arrays,
       depth = depth$arrays,
       depth_frame = depth$frame,
       raw = raw
@@ -417,7 +425,7 @@ DS <- local({
   }
   
   ## ---------- aggregert kundedata ----------
-  orderbook <- function(instrument, time = NULL){
+  orderbook <- function(instrument, time = NULL, normalize = TRUE){
     .check_cfg()
     url <- sprintf("%s/instruments/%s/orderBook", base_url_f(), instrument)
     req <- .req_base(url)
@@ -425,7 +433,11 @@ DS <- local({
     resp <- httr2::req_perform(req)
     httr2::resp_check_status(resp)
     raw <- jsonlite::fromJSON(httr2::resp_body_string(resp), simplifyVector = TRUE)
-    .normalize_orderbook(raw, instrument)
+    if (isTRUE(normalize)) {
+      .normalize_orderbook(raw, instrument)
+    } else {
+      raw
+    }
   }
   
   positionbook <- function(instrument, time = NULL){

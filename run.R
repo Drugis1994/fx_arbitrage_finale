@@ -7,31 +7,6 @@ suppressPackageStartupMessages({
   library(curl);  library(rlang);     library(tidyr); library(dotenv)
 })
 
-# --- Root resolution helpers (available before sourcing utils) ---
-resolve_root <- function() {
-  env_root <- Sys.getenv("FX_ARBITRAGE_ROOT", unset = NA_character_)
-  if (!is.na(env_root) && nzchar(env_root)) {
-    return(normalizePath(env_root, mustWork = FALSE))
-  }
-
-  this_file <- tryCatch(normalizePath(sys.frame(1)$ofile, mustWork = TRUE), error = function(...) NA_character_)
-  if (!is.na(this_file)) {
-    return(normalizePath(dirname(this_file), mustWork = FALSE))
-  }
-
-  normalizePath(getwd(), mustWork = FALSE)
-}
-
-load_env_files <- function(root) {
-  env_path <- file.path(root, ".env")
-  if (requireNamespace("dotenv", quietly = TRUE) && file.exists(env_path)) {
-    dotenv::load_dot_env(env_path, override = FALSE)
-  } else if (file.exists(env_path)) {
-    readRenviron(env_path)
-  }
-  invisible(TRUE)
-}
-
 # --- Reset debug state ---
 suppressWarnings({
   options(error = NULL)
@@ -44,8 +19,20 @@ suppressWarnings({
 
 # --- Project root ---
 Sys.setenv(CURL_DNS_SERVERS = "1.1.1.1,8.8.8.8")
+candidate_root <- Sys.getenv("FX_ARBITRAGE_ROOT", unset = normalizePath(getwd(), mustWork = FALSE))
+utils_path <- file.path(candidate_root, "R/utils.R")
+if (!file.exists(utils_path)) {
+  alt <- file.path(getwd(), "R/utils.R")
+  if (file.exists(alt)) {
+    utils_path <- alt
+  } else {
+    stop("Could not locate R/utils.R. Set FX_ARBITRAGE_ROOT or run from project root.")
+  }
+}
 
-ROOT <- resolve_root()
+source(utils_path)
+
+ROOT <- normalizePath(resolve_root(), mustWork = FALSE)
 setwd(ROOT)
 
 load_env_files(ROOT)
@@ -79,8 +66,9 @@ source(file.path(ROOT, "R/Engine_Wrapper.R"))
 engine_load <- function(path = NULL) {
   libname <- paste0("libengine_v4", .Platform$dynlib.ext)
   default_path <- file.path(ROOT, "C++", libname)
-  path <- path %||% default_path
-  p <- normalizePath(path, mustWork = TRUE)
+  env_path <- Sys.getenv("FX_ENGINE_LIB", unset = NA_character_)
+  chosen <- path %||% env_path %||% default_path
+  p <- normalizePath(chosen, mustWork = TRUE)
   if (!is.loaded("engine_poll_R")) dyn.load(p)
   invisible(TRUE)
 }

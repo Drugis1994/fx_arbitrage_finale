@@ -11,8 +11,10 @@
 #include <time.h>
 
 // Fixed ring sizes (A: fixed lock-free ringbuffer)
-RB_DEFINE(tick_rb_t, tick_t, 8192)
-RB_DEFINE(result_rb_t, result_t, 8192)
+#define TICK_RB_CAPACITY 8192
+#define RESULT_RB_CAPACITY 8192
+RB_DEFINE(tick_rb_t, tick_t, TICK_RB_CAPACITY)
+RB_DEFINE(result_rb_t, result_t, RESULT_RB_CAPACITY)
 
 struct engine_t
 {
@@ -30,11 +32,14 @@ struct engine_t
     tick_rb_t tick_rb;
     result_rb_t result_rb;
 
-    // Telemetry
-    uint64_t ticks_received;
-    uint64_t ticks_dropped;
-    uint64_t results_emitted;
-    uint64_t results_dropped;
+    // Telemetry (atomics to avoid races between producer + engine thread)
+    atomic_uint_fast64_t ticks_received;
+    atomic_uint_fast64_t ticks_dropped;
+    atomic_uint_fast64_t results_emitted;
+    atomic_uint_fast64_t results_dropped;
+    atomic_uint_fast64_t matrix_update_failures;
+
+    uint64_t last_tick_ts_ns;
 
     // scratch (avoid malloc each eval)
     double start_qty;
@@ -46,13 +51,34 @@ static inline int tick_payload_ok(const engine_t *e, int i_1b, int j_1b, double 
         return 0;
     if (i_1b < 1 || j_1b < 1 || i_1b > e->n_ccy || j_1b > e->n_ccy)
         return 0;
+    if (i_1b == j_1b)
+        return 0;
     if (!isfinite(bid) || !isfinite(ask))
         return 0;
     if (bid <= 0.0 || ask <= 0.0)
         return 0;
     if (ask < bid) // basic spread sanity check
         return 0;
+    double spread = ask - bid;
+    if (!isfinite(spread) || spread < 0.0)
+        return 0;
     return 1;
+}
+
+static inline size_t tick_rb_used(const tick_rb_t *rb)
+{
+    size_t h = atomic_load_explicit(&rb->head, memory_order_acquire);
+    size_t t = atomic_load_explicit(&rb->tail, memory_order_acquire);
+    if (h >= t)
+        return h - t;
+    return (size_t)TICK_RB_CAPACITY - (t - h);
+}
+
+static inline int tick_rb_has_capacity(const tick_rb_t *rb, size_t needed)
+{
+    const size_t usable = TICK_RB_CAPACITY - 1; // ringbuffer keeps one slot open
+    size_t used = tick_rb_used(rb);
+    return used + needed <= usable;
 }
 
 // ---------- Engine core math ----------
@@ -122,11 +148,11 @@ static void eval_all_routes(engine_t *e)
                     r.ts_ns = ts;
                     if (result_rb_t_push(&e->result_rb, &r))
                     {
-                        e->results_emitted++;
+                        atomic_fetch_add_explicit(&e->results_emitted, 1u, memory_order_relaxed);
                     }
                     else
                     {
-                        e->results_dropped++;
+                        atomic_fetch_add_explicit(&e->results_dropped, 1u, memory_order_relaxed);
                     }
                 }
             }
@@ -150,11 +176,11 @@ static void eval_all_routes(engine_t *e)
                 r.ts_ns = ts;
                 if (result_rb_t_push(&e->result_rb, &r))
                 {
-                    e->results_emitted++;
+                    atomic_fetch_add_explicit(&e->results_emitted, 1u, memory_order_relaxed);
                 }
                 else
                 {
-                    e->results_dropped++;
+                    atomic_fetch_add_explicit(&e->results_dropped, 1u, memory_order_relaxed);
                 }
             }
         }
@@ -210,11 +236,11 @@ static void eval_all_routes(engine_t *e)
             r.ts_ns = ts;
             if (result_rb_t_push(&e->result_rb, &r))
             {
-                e->results_emitted++;
+                atomic_fetch_add_explicit(&e->results_emitted, 1u, memory_order_relaxed);
             }
             else
             {
-                e->results_dropped++;
+                atomic_fetch_add_explicit(&e->results_dropped, 1u, memory_order_relaxed);
             }
         }
     }
@@ -239,15 +265,29 @@ static void *engine_thread_main(void *p)
 
         if (!tick_payload_ok(e, t.i_1b, t.j_1b, t.bid, t.ask))
         {
-            e->ticks_dropped++;
+            atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
             continue;
         }
 
+        if (t.ts_ns != 0 && e->last_tick_ts_ns != 0 && t.ts_ns < e->last_tick_ts_ns)
+        {
+            atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
+            continue;
+        }
+        e->last_tick_ts_ns = t.ts_ns;
+
         int i0 = t.i_1b - 1;
         int j0 = t.j_1b - 1;
+        if (!matrix_in_bounds(&e->mat, i0, j0))
+        {
+            atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit(&e->matrix_update_failures, 1u, memory_order_relaxed);
+            continue;
+        }
         if (!matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask))
         {
-            e->ticks_dropped++;
+            atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
+            atomic_fetch_add_explicit(&e->matrix_update_failures, 1u, memory_order_relaxed);
             continue;
         }
 
@@ -255,15 +295,22 @@ static void *engine_thread_main(void *p)
         {
             if (!tick_payload_ok(e, t.i_1b, t.j_1b, t.bid, t.ask))
             {
-                e->ticks_dropped++;
+                atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
                 continue;
             }
 
             i0 = t.i_1b - 1;
             j0 = t.j_1b - 1;
+            if (!matrix_in_bounds(&e->mat, i0, j0))
+            {
+                atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&e->matrix_update_failures, 1u, memory_order_relaxed);
+                continue;
+            }
             if (!matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask))
             {
-                e->ticks_dropped++;
+                atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
+                atomic_fetch_add_explicit(&e->matrix_update_failures, 1u, memory_order_relaxed);
                 continue;
             }
         }
@@ -289,10 +336,12 @@ static engine_t *engine_alloc_common(int n_ccy, int start_i_1b)
     e->start0 = start_i_1b - 1;
     e->start_qty = 100000.0;
 
-    e->ticks_received  = 0;
-    e->ticks_dropped   = 0;
-    e->results_emitted = 0;
-    e->results_dropped = 0;
+    atomic_init(&e->ticks_received, 0u);
+    atomic_init(&e->ticks_dropped, 0u);
+    atomic_init(&e->results_emitted, 0u);
+    atomic_init(&e->results_dropped, 0u);
+    atomic_init(&e->matrix_update_failures, 0u);
+    e->last_tick_ts_ns = 0;
 
     if (!matrix_init(&e->mat, n_ccy))
     {
@@ -382,7 +431,7 @@ int engine_push_tick(engine_t *e, int i_1b, int j_1b, double bid, double ask)
 
     if (!tick_payload_ok(e, i_1b, j_1b, bid, ask))
     {
-        e->ticks_dropped++;
+        atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
         return 0;
     }
 
@@ -395,14 +444,20 @@ int engine_push_tick(engine_t *e, int i_1b, int j_1b, double bid, double ask)
     if (t.ts_ns == 0)
         t.ts_ns = 1; // avoid zero timestamps
 
+    if (!tick_rb_has_capacity(&e->tick_rb, 1))
+    {
+        atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
+        return 0;
+    }
+
     int ok = tick_rb_t_push(&e->tick_rb, &t);
     if (ok)
     {
-        e->ticks_received++;
+        atomic_fetch_add_explicit(&e->ticks_received, 1u, memory_order_relaxed);
     }
     else
     {
-        e->ticks_dropped++;
+        atomic_fetch_add_explicit(&e->ticks_dropped, 1u, memory_order_relaxed);
     }
     return ok;
 }

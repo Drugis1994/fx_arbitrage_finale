@@ -9,3 +9,6 @@ dev/
 .Ruserdata
 .env
 .env.local
+build/
+cmake-build-*/
+.vscode/

@@ -20,7 +20,13 @@ extern "C"
 
     static inline int matrix_in_bounds(const matrix_t *m, int i0, int j0)
     {
-        return m && i0 >= 0 && j0 >= 0 && i0 < m->n && j0 < m->n;
+        if (!m)
+            return 0;
+        if (m->n <= 0)
+            return 0;
+        if (!m->BID || !m->ASK)
+            return 0;
+        return i0 >= 0 && j0 >= 0 && i0 < m->n && j0 < m->n;
     }
 
     static inline size_t matrix_idx(const matrix_t *m, int i0, int j0)
@@ -31,6 +37,12 @@ extern "C"
     static inline int matrix_update_pair(matrix_t *m, int i0, int j0, double bid, double ask)
     {
         if (!matrix_in_bounds(m, i0, j0))
+            return 0;
+
+        if (!isfinite(bid) || !isfinite(ask))
+            return 0;
+
+        if (bid <= 0.0 || ask <= 0.0)
             return 0;
 
         size_t k = matrix_idx(m, i0, j0);

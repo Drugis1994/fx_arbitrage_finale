@@ -4,6 +4,12 @@
 # --- Convert "EUR/USD" → "EUR_USD"
 .cr_pair_to_sym <- function(pair) gsub("/", "_", pair, fixed = TRUE)
 
+# --- Defensive orderbook fetcher (never throws)
+.ds_orderbook_safe <- function(DS, instrument) {
+  if (is.null(DS) || !is.list(DS) || is.null(DS$orderbook)) return(NULL)
+  tryCatch(DS$orderbook(instrument, normalize = TRUE), error = function(...) NULL)
+}
+
 # --- Extract sorted list of currencies
 infer_ccys_from_instruments <- function(instruments) {
   pairs <- vapply(instruments, .cr_sym_to_pair, character(1))
@@ -124,7 +130,10 @@ init_state <- function(DS, instruments, start_ccy = "USD") {
   state$ASK       <- ASK
   state$M         <- M
   state$pair_idx  <- pair_idx
-  state$routes    <- NULL
+  routes <- build_tri_routes(ccys, start_ccy)
+
+  state$routes    <- routes
+  state$routes_df <- attr(routes, "route_df")
   state$start_ccy <- start_ccy
   state$latest    <- new.env()
   state$ob_cache  <- new.env()

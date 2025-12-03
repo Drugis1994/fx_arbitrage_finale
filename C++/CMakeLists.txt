@@ -13,12 +13,10 @@ endif()
 
 # ---- Finn R include path ----
 execute_process(
-  COMMAND R RHOME
-  OUTPUT_VARIABLE R_HOME
+  COMMAND Rscript -e "cat(R.home('include'))"
+  OUTPUT_VARIABLE R_INCLUDE_DIR
   OUTPUT_STRIP_TRAILING_WHITESPACE
 )
-
-set(R_INCLUDE_DIR "${R_HOME}/include")
 
 # ---- Kilder ----
 set(SRC
@@ -48,3 +46,15 @@ if (CMAKE_C_COMPILER_ID MATCHES "Clang|AppleClang|GNU")
 endif()
 
 set_target_properties(engine_v4 PROPERTIES OUTPUT_NAME "engine_v4")
+
+enable_testing()
+
+add_executable(matrix_tests
+    test_matrix.c
+    matrix.c
+)
+target_include_directories(matrix_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+if(NOT WIN32)
+    target_link_libraries(matrix_tests PRIVATE m)
+endif()
+add_test(NAME matrix_tests COMMAND matrix_tests)
