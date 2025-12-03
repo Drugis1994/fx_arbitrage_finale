@@ -124,7 +124,7 @@ init_state <- function(DS, instruments, start_ccy = "USD") {
   state$ASK       <- ASK
   state$M         <- M
   state$pair_idx  <- pair_idx
-  state$routes    <- routes
+  state$routes    <- NULL
   state$start_ccy <- start_ccy
   state$latest    <- new.env()
   state$ob_cache  <- new.env()

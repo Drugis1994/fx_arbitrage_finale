@@ -7,6 +7,31 @@ suppressPackageStartupMessages({
   library(curl);  library(rlang);     library(tidyr); library(dotenv)
 })
 
+# --- Root resolution helpers (available before sourcing utils) ---
+resolve_root <- function() {
+  env_root <- Sys.getenv("FX_ARBITRAGE_ROOT", unset = NA_character_)
+  if (!is.na(env_root) && nzchar(env_root)) {
+    return(normalizePath(env_root, mustWork = FALSE))
+  }
+
+  this_file <- tryCatch(normalizePath(sys.frame(1)$ofile, mustWork = TRUE), error = function(...) NA_character_)
+  if (!is.na(this_file)) {
+    return(normalizePath(dirname(this_file), mustWork = FALSE))
+  }
+
+  normalizePath(getwd(), mustWork = FALSE)
+}
+
+load_env_files <- function(root) {
+  env_path <- file.path(root, ".env")
+  if (requireNamespace("dotenv", quietly = TRUE) && file.exists(env_path)) {
+    dotenv::load_dot_env(env_path, override = FALSE)
+  } else if (file.exists(env_path)) {
+    readRenviron(env_path)
+  }
+  invisible(TRUE)
+}
+
 # --- Reset debug state ---
 suppressWarnings({
   options(error = NULL)
@@ -20,13 +45,10 @@ suppressWarnings({
 # --- Project root ---
 Sys.setenv(CURL_DNS_SERVERS = "1.1.1.1,8.8.8.8")
 
-ROOT <- normalizePath(Sys.getenv("FX_ARBITRAGE_ROOT", unset = getwd()))
+ROOT <- resolve_root()
 setwd(ROOT)
 
-env_path <- file.path(ROOT, ".env")
-if (file.exists(env_path)) readRenviron(env_path)
-
-`%||%` <- function(x, y) if (is.null(x)) y else x
+load_env_files(ROOT)
 
 # --- Tuning knobs ---
 options(
@@ -47,13 +69,17 @@ options(
 )
 
 # --- Load core files ---
+source(file.path(ROOT, "R/utils.R"))
 source(file.path(ROOT, "R/core_runtime.R"))
 source(file.path(ROOT, "R/DirectStream.R"))
-source(file.path(ROOT, "R/trading_bot.R"))
+source(file.path(ROOT, "R/Trading_Bot.R"))
 source(file.path(ROOT, "R/Engine_Wrapper.R"))
 
 # --- Load C++ engine (minimal) ---
-engine_load <- function(path = file.path(ROOT, "C++", "libengine_v4.dylib")) {
+engine_load <- function(path = NULL) {
+  libname <- paste0("libengine_v4", .Platform$dynlib.ext)
+  default_path <- file.path(ROOT, "C++", libname)
+  path <- path %||% default_path
   p <- normalizePath(path, mustWork = TRUE)
   if (!is.loaded("engine_poll_R")) dyn.load(p)
   invisible(TRUE)
