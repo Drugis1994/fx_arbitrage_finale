@@ -88,6 +88,65 @@ DS <- local({
     # Atomisk vektor
     suppressWarnings(as.numeric(utils::tail(x, 1)))
   }
+
+  .normalize_depth <- function(buckets, depth_limit = 10L) {
+    if (is.null(buckets) || length(buckets) == 0) {
+      empty <- data.frame(
+        level = integer(), bid_price = numeric(), bid_size = numeric(),
+        ask_price = numeric(), ask_size = numeric(), stringsAsFactors = FALSE
+      )
+      return(list(frame = empty, arrays = list(
+        bid = list(price = numeric(), size = numeric()),
+        ask = list(price = numeric(), size = numeric())
+      )))
+    }
+
+    df <- as.data.frame(buckets)
+    price <- suppressWarnings(as.numeric(df$price))
+    bid_sz <- suppressWarnings(as.numeric(df$longCountPercent %||% df$bid_size %||% df$longCount %||% df$bidVolume %||% df$longCountPercent))
+    ask_sz <- suppressWarnings(as.numeric(df$shortCountPercent %||% df$ask_size %||% df$shortCount %||% df$askVolume %||% df$shortCountPercent))
+
+    depth_df <- data.frame(
+      level = seq_len(NROW(df)),
+      bid_price = price,
+      bid_size = bid_sz,
+      ask_price = price,
+      ask_size = ask_sz,
+      stringsAsFactors = FALSE
+    )
+
+    depth_df <- depth_df[seq_len(min(nrow(depth_df), depth_limit)), , drop = FALSE]
+
+    list(
+      frame = depth_df,
+      arrays = list(
+        bid = list(price = depth_df$bid_price, size = depth_df$bid_size),
+        ask = list(price = depth_df$ask_price, size = depth_df$ask_size)
+      )
+    )
+  }
+
+  .normalize_orderbook <- function(raw, instrument) {
+    ts <- raw$time %||% raw$timestamp %||% raw$orderBook$time %||% NA_character_
+    buckets <- raw$orderBook$buckets %||% raw$buckets %||% NULL
+    depth <- .normalize_depth(buckets)
+
+    l1_bid <- if (nrow(depth$frame) > 0) depth$frame$bid_price[[1]] else NA_real_
+    l1_ask <- if (nrow(depth$frame) > 0) depth$frame$ask_price[[1]] else NA_real_
+
+    list(
+      instrument = instrument,
+      timestamp = ts,
+      provider = "oanda-practice",
+      l1 = list(
+        bid = list(price = l1_bid, size = depth$frame$bid_size[[1]] %||% NA_real_),
+        ask = list(price = l1_ask, size = depth$frame$ask_size[[1]] %||% NA_real_)
+      ),
+      depth = depth$arrays,
+      depth_frame = depth$frame,
+      raw = raw
+    )
+  }
   
   ## ---------- konto/instrument ----------
   ping <- function(){
@@ -365,7 +424,8 @@ DS <- local({
     if (!is.null(time)) req <- httr2::req_url_query(req, time = time)
     resp <- httr2::req_perform(req)
     httr2::resp_check_status(resp)
-    jsonlite::fromJSON(httr2::resp_body_string(resp), simplifyVector = TRUE)
+    raw <- jsonlite::fromJSON(httr2::resp_body_string(resp), simplifyVector = TRUE)
+    .normalize_orderbook(raw, instrument)
   }
   
   positionbook <- function(instrument, time = NULL){

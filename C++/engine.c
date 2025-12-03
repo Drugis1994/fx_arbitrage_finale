@@ -40,6 +40,21 @@ struct engine_t
     double start_qty;
 };
 
+static inline int tick_payload_ok(const engine_t *e, int i_1b, int j_1b, double bid, double ask)
+{
+    if (!e)
+        return 0;
+    if (i_1b < 1 || j_1b < 1 || i_1b > e->n_ccy || j_1b > e->n_ccy)
+        return 0;
+    if (!isfinite(bid) || !isfinite(ask))
+        return 0;
+    if (bid <= 0.0 || ask <= 0.0)
+        return 0;
+    if (ask < bid) // basic spread sanity check
+        return 0;
+    return 1;
+}
+
 // ---------- Engine core math ----------
 // TRI semantics matches din gamle engine:
 // qty_mid = start_qty / ASK[start, mid]
@@ -222,15 +237,35 @@ static void *engine_thread_main(void *p)
             continue;
         }
 
+        if (!tick_payload_ok(e, t.i_1b, t.j_1b, t.bid, t.ask))
+        {
+            e->ticks_dropped++;
+            continue;
+        }
+
         int i0 = t.i_1b - 1;
         int j0 = t.j_1b - 1;
-        matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask);
+        if (!matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask))
+        {
+            e->ticks_dropped++;
+            continue;
+        }
 
         while (tick_rb_t_pop(&e->tick_rb, &t))
         {
+            if (!tick_payload_ok(e, t.i_1b, t.j_1b, t.bid, t.ask))
+            {
+                e->ticks_dropped++;
+                continue;
+            }
+
             i0 = t.i_1b - 1;
             j0 = t.j_1b - 1;
-            matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask);
+            if (!matrix_update_pair(&e->mat, i0, j0, t.bid, t.ask))
+            {
+                e->ticks_dropped++;
+                continue;
+            }
         }
 
         eval_all_routes(e);
@@ -345,17 +380,28 @@ int engine_push_tick(engine_t *e, int i_1b, int j_1b, double bid, double ask)
     if (!e)
         return 0;
 
+    if (!tick_payload_ok(e, i_1b, j_1b, bid, ask))
+    {
+        e->ticks_dropped++;
+        return 0;
+    }
+
     tick_t t;
     t.i_1b = i_1b;
     t.j_1b = j_1b;
     t.bid = bid;
     t.ask = ask;
     t.ts_ns = ticks_now_ns();
+    if (t.ts_ns == 0)
+        t.ts_ns = 1; // avoid zero timestamps
 
     int ok = tick_rb_t_push(&e->tick_rb, &t);
-    if (ok) {
+    if (ok)
+    {
         e->ticks_received++;
-    } else {
+    }
+    else
+    {
         e->ticks_dropped++;
     }
     return ok;

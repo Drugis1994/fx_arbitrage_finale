@@ -95,24 +95,25 @@ engine_poll <- function(ptr) {
 engine_init <- function(state, start_ccy) {
   start_i <- match(start_ccy, state$ccys)
   if (is.na(start_i)) stop("start_ccy not in state$ccys")
-  
-  # Build TRI routes
+
+  # Build TRI routes (S=start_ccy, X=mid, Y=end)
   routes <- build_tri_routes(state$ccys, start_ccy)
   state$routes <- routes
-  
+  state$routes_df <- attr(routes, "route_df")
+
   # Create engine in C
   state$eng <- engine_create(
     routes_matrix = routes,
     start_ccy_index = start_i,
     n_ccy = length(state$ccys)
   )
-  
+
   # Fill matrix
   engine_push_full(state$eng, state$M, state$BID, state$ASK)
-  
+
   # Start computation thread
   engine_start(state$eng)
-  
+
   state
 }
 
