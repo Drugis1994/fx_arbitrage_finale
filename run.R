@@ -75,10 +75,13 @@ source(file.path(ROOT, "R/DirectStream.R"))
 source(file.path(ROOT, "R/Trading_Bot.R"))
 source(file.path(ROOT, "R/Engine_Wrapper.R"))
 
+TESTING_MODE <- identical(Sys.getenv("FX_ARBITRAGE_TESTING"), "1")
+
 # --- Load C++ engine (minimal) ---
 engine_load <- function(path = NULL) {
   libname <- paste0("libengine_v4", .Platform$dynlib.ext)
-  default_path <- file.path(ROOT, "C++", libname)
+  env_path <- Sys.getenv("ENGINE_LIB_PATH", unset = "")
+  default_path <- if (nzchar(env_path)) env_path else file.path(ROOT, "C++", libname)
   path <- path %||% default_path
   p <- normalizePath(path, mustWork = TRUE)
   if (!is.loaded("engine_poll_R")) dyn.load(p)
@@ -88,88 +91,92 @@ engine_load()
 
 message("✅ All core scripts loaded.")
 
-# --- Bootstrap ---
-stopifnot(DS$has_auth())
-cat("🚀 Oppsett klart…\n")
+if (TESTING_MODE) {
+  message("FX_ARBITRAGE_TESTING=1: skipping live startup.")
+} else {
+  # --- Bootstrap ---
+  stopifnot(DS$has_auth())
+  cat("🚀 Oppsett klart…\n")
 
 
-all_instr <- DS$list_symbols()
-STREAM_UNIVERSE <- as.character(all_instr)
+  all_instr <- DS$list_symbols()
+  STREAM_UNIVERSE <- as.character(all_instr)
 
-cat(sprintf("\n📦 Abonnerer på %d instrumenter:\n%s\n",
-            length(STREAM_UNIVERSE),
-            paste(STREAM_UNIVERSE, collapse = ", ")))
+  cat(sprintf("\n📦 Abonnerer på %d instrumenter:\n%s\n",
+              length(STREAM_UNIVERSE),
+              paste(STREAM_UNIVERSE, collapse = ", ")))
 
-# --- Build state ---
-state <- init_state(
-  DS          = DS,
-  instruments = STREAM_UNIVERSE,
-  start_ccy   = getOption("arb.start_ccy")
-)
+  # --- Build state ---
+  state <- init_state(
+    DS          = DS,
+    instruments = STREAM_UNIVERSE,
+    start_ccy   = getOption("arb.start_ccy")
+  )
 
-# --------------------------------------------------------
-# ⭐⭐⭐ INIT ENGINE EXACTLY HERE ⭐⭐⭐
-# --------------------------------------------------------
-start_ccy <- getOption("arb.start_ccy")
-engine_init(state, start_ccy)
-# --------------------------------------------------------
+  # --------------------------------------------------------
+  # ⭐⭐⭐ INIT ENGINE EXACTLY HERE ⭐⭐⭐
+  # --------------------------------------------------------
+  start_ccy <- getOption("arb.start_ccy")
+  engine_init(state, start_ccy)
+  # --------------------------------------------------------
 
-# --- Tick handler ---
-on_tick <- make_on_tick(state)
+  # --- Tick handler ---
+  on_tick <- make_on_tick(state)
 
 
-# =====================================================================
-# 📊 PRINT RESULTATER + BEN-FOR-BEN DEBUGGING
-# =====================================================================
-poll_and_print <- function(state) {
-  res <- engine_poll(state$eng)
-  
-  if (is.null(res) || nrow(res) == 0) {
-    cat("❕ Ingen ruter funnet i denne ticken\n")
-    return(invisible())
+  # =====================================================================
+  # 📊 PRINT RESULTATER + BEN-FOR-BEN DEBUGGING
+  # =====================================================================
+  poll_and_print <- function(state) {
+    res <- engine_poll(state$eng)
+
+    if (is.null(res) || nrow(res) == 0) {
+      cat("❕ Ingen ruter funnet i denne ticken\n")
+      return(invisible())
+    }
+
+    cat("──────────────────────────────────────────────\n")
+    cat("📊 TRI-ARBITRAGE RESULTATER (", nrow(res), " ruter )\n", sep="")
+
+    for (k in seq_len(nrow(res))) {
+      r <- res[k, ]
+
+      cat(sprintf(
+        "• route_id=%d | mid=%s | end=%s | pnl=%.5f | edge=%.5f | pct=%.3f%% | ns=%s\n",
+        r$route_id, r$mid, r$end, r$pnl, r$edge, r$pct*100, format(ns(), scientific = FALSE)
+      ))
+    }
   }
-  
-  cat("──────────────────────────────────────────────\n")
-  cat("📊 TRI-ARBITRAGE RESULTATER (", nrow(res), " ruter )\n", sep="")
-  
-  for (k in seq_len(nrow(res))) {
-    r <- res[k, ]
-    
-    cat(sprintf(
-      "• route_id=%d | mid=%s | end=%s | pnl=%.5f | edge=%.5f | pct=%.3f%% | ns=%s\n",
-      r$route_id, r$mid, r$end, r$pnl, r$edge, r$pct*100, format(ns(), scientific = FALSE)
-    ))
+
+
+  # =====================================================================
+  # 🔄 WRAPPED TICK
+  # =====================================================================
+  wrapped_on_tick <- function(sym, bid, ask, time) {
+
+    if (identical(sym, "HEARTBEAT")) return(invisible())
+
+    on_tick(sym, bid, ask, time)
+
+    poll_and_print(state)
   }
+
+
+  # =====================================================================
+  # 🔴 START STREAM
+  # =====================================================================
+  cat("\n🔴 Starter LIVE stream… (Ctrl+C for å stoppe)\n")
+
+  DS$stream_prices(
+    instruments        = STREAM_UNIVERSE,
+    on_tick            = wrapped_on_tick,
+    include_heartbeats = TRUE,
+    verbose            = TRUE,
+    snapshot           = TRUE
+  )
+
+  cat("✅ Ferdig.\n")
 }
-
-
-# =====================================================================
-# 🔄 WRAPPED TICK
-# =====================================================================
-wrapped_on_tick <- function(sym, bid, ask, time) {
-  
-  if (identical(sym, "HEARTBEAT")) return(invisible())
-  
-  on_tick(sym, bid, ask, time)
-  
-  poll_and_print(state)
-}
-
-
-# =====================================================================
-# 🔴 START STREAM
-# =====================================================================
-cat("\n🔴 Starter LIVE stream… (Ctrl+C for å stoppe)\n")
-
-DS$stream_prices(
-  instruments        = STREAM_UNIVERSE,
-  on_tick            = wrapped_on_tick,
-  include_heartbeats = TRUE,
-  verbose            = TRUE,
-  snapshot           = TRUE
-)
-
-cat("✅ Ferdig.\n")
 
 
 

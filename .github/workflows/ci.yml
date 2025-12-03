@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-and-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest]
+    env:
+      CTEST_OUTPUT_ON_FAILURE: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake r-base r-base-dev libcurl4-openssl-dev libssl-dev
+
+      - name: Install R packages
+        run: |
+          Rscript -e 'install.packages(c("testthat","httr2","jsonlite","dplyr","lubridate","readr","curl","rlang","tidyr","dotenv","Rcpp"), repos="https://cloud.r-project.org")'
+
+      - name: Configure CMake
+        run: cmake -S C++ -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_SANITIZERS=OFF
+
+      - name: Build
+        run: cmake --build build --config RelWithDebInfo
+
+      - name: C tests
+        run: ctest --test-dir build --output-on-failure
+
+      - name: R tests
+        env:
+          ENGINE_LIB_PATH: ${{ github.workspace }}/build/libengine_v4${{ runner.os == 'Windows' && '.dll' || runner.os == 'macOS' && '.dylib' || '.so' }}
+          FX_ARBITRAGE_TESTING: "1"
+        run: |
+          Rscript -e 'testthat::test_dir("R/tests/testthat", reporter = "summary")'

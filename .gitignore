@@ -1,11 +1,1 @@
-.Rproj.user/
-.DS_Store
-dev/
-*~
-*.swp
-*.swo
-.Rhistory
-.RData
-.Ruserdata
-.env
-.env.local
+build/

@@ -101,7 +101,11 @@ DS <- local({
       )))
     }
 
-    df <- as.data.frame(buckets)
+    if (is.data.frame(buckets)) {
+      df <- buckets
+    } else {
+      df <- do.call(rbind, lapply(buckets, function(x) as.data.frame(x, stringsAsFactors = FALSE)))
+    }
     price <- suppressWarnings(as.numeric(df$price))
     bid_sz <- suppressWarnings(as.numeric(df$longCountPercent %||% df$bid_size %||% df$longCount %||% df$bidVolume %||% df$longCountPercent))
     ask_sz <- suppressWarnings(as.numeric(df$shortCountPercent %||% df$ask_size %||% df$shortCount %||% df$askVolume %||% df$shortCountPercent))
